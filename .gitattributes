@@ -1,0 +1,10 @@
+# Ignore model files
+*.keras
+*.h5
+*.pb
+*.pt
+*.pth
+
+# Ignore models folder
+models/
+src/models/
