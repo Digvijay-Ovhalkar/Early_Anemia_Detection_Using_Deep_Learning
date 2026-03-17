@@ -1,215 +1,233 @@
 import tensorflow as tf
-from tensorflow.keras import layers, models
-from tensorflow.keras.utils import image_dataset_from_directory
+from tensorflow.keras.preprocessing.image import ImageDataGenerator
+from tensorflow.keras.applications import MobileNetV2
+from tensorflow.keras.layers import Dense, GlobalAveragePooling2D, Dropout
+from tensorflow.keras.models import Model
+from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
+from sklearn.utils.class_weight import compute_class_weight
+from sklearn.metrics import confusion_matrix, classification_report
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
 import os
 
-# =====================================================
-# GPU MEMORY SETUP
-# =====================================================
-gpus = tf.config.experimental.list_physical_devices('GPU')
-if gpus:
-    try:
-        for gpu in gpus:
-            tf.config.experimental.set_memory_growth(gpu, True)
-        print("✅ GPU memory growth enabled")
-    except RuntimeError as e:
-        print(e)
-
-tf.keras.backend.clear_session()
-
-# =====================================================
+# ==============================
 # PATHS
-# =====================================================
-train_path = r"C:/Users/Lenovo/OneDrive/Desktop/AI-Anemia-Detection/src/dataset/train"
-val_path   = r"C:/Users/Lenovo/OneDrive/Desktop/AI-Anemia-Detection/src/dataset/val"
-test_path  = r"C:/Users/Lenovo/OneDrive/Desktop/AI-Anemia-Detection/src/dataset/test"
+# ==============================
 
-IMG_SIZE = (224, 224)
-BATCH_SIZE = 16
-EPOCHS_INITIAL = 30
-EPOCHS_FINE = 10
+DATASET_PATH = r"C:/Users/Lenovo/OneDrive/Desktop/AI-Anemia-Detection/src/dataset/train"
+MODEL_SAVE_PATH = r"C:/Users/Lenovo/OneDrive/Desktop/AI-Anemia-Detection/src/models/anemia_final.keras"
 
-# =====================================================
-# DATASET CHECK
-# =====================================================
-def check_dataset(path):
-    if not os.path.exists(path):
-        raise FileNotFoundError(f"Dataset path not found: {path}")
-    subdirs = [d for d in os.listdir(path) if os.path.isdir(os.path.join(path, d))]
-    if not subdirs:
-        raise ValueError(f"No class subfolders found in: {path}")
-    print(f"✅ Dataset found at: {path}")
-    print(f"Classes: {subdirs}")
+IMG_SIZE = 224
+BATCH_SIZE = 32
+EPOCHS = 30
 
-check_dataset(train_path)
-check_dataset(val_path)
-check_dataset(test_path)
+# ==============================
+# DATA AUGMENTATION
+# ==============================
 
-# =====================================================
-# LOAD DATASETS
-# =====================================================
-train_ds = image_dataset_from_directory(
-    train_path,
-    image_size=IMG_SIZE,
-    batch_size=BATCH_SIZE,
-    shuffle=True
+train_datagen = ImageDataGenerator(
+    rescale=1./255,
+    validation_split=0.2,
+    rotation_range=20,
+    zoom_range=0.2,
+    horizontal_flip=True,
+    shear_range=0.15,
+    brightness_range=[0.8,1.2]
 )
 
-val_ds = image_dataset_from_directory(
-    val_path,
-    image_size=IMG_SIZE,
+train_generator = train_datagen.flow_from_directory(
+    DATASET_PATH,
+    target_size=(IMG_SIZE, IMG_SIZE),
     batch_size=BATCH_SIZE,
-    shuffle=False
+    class_mode='categorical',
+    subset='training'
 )
 
-test_ds = image_dataset_from_directory(
-    test_path,
-    image_size=IMG_SIZE,
+val_generator = train_datagen.flow_from_directory(
+    DATASET_PATH,
+    target_size=(IMG_SIZE, IMG_SIZE),
     batch_size=BATCH_SIZE,
-    shuffle=False
+    class_mode='categorical',
+    subset='validation'
 )
 
-class_names = train_ds.class_names
-num_classes = len(class_names)
-print("✅ Classes used:", class_names)
+CLASS_NAMES = list(train_generator.class_indices.keys())
+NUM_CLASSES = len(CLASS_NAMES)
 
-# =====================================================
-# PERFORMANCE OPTIMIZATION
-# =====================================================
-AUTOTUNE = tf.data.AUTOTUNE
-train_ds = train_ds.cache().shuffle(1000).prefetch(AUTOTUNE)
-val_ds   = val_ds.cache().prefetch(AUTOTUNE)
-test_ds  = test_ds.cache().prefetch(AUTOTUNE)
+print("Classes:", CLASS_NAMES)
 
-# =====================================================
-# NORMALIZATION + AUGMENTATION
-# =====================================================
-normalization = layers.Rescaling(1./255)
+# ==============================
+# CLASS WEIGHTS (BALANCE DATA)
+# ==============================
 
-data_augmentation = tf.keras.Sequential([
-    layers.RandomFlip("horizontal"),
-    layers.RandomRotation(0.1),
-    layers.RandomZoom(0.1),
-    layers.RandomContrast(0.1),
-])
+y_train = train_generator.classes
 
-# =====================================================
+class_weights = compute_class_weight(
+    class_weight='balanced',
+    classes=np.unique(y_train),
+    y=y_train
+)
+
+class_weights = dict(enumerate(class_weights))
+
+print("Class Weights:", class_weights)
+
+# ==============================
 # TRANSFER LEARNING MODEL
-# =====================================================
-base_model = tf.keras.applications.MobileNetV2(
-    input_shape=(224,224,3),
+# ==============================
+
+base_model = MobileNetV2(
+    weights='imagenet',
     include_top=False,
-    weights="imagenet"
+    input_shape=(IMG_SIZE, IMG_SIZE, 3)
 )
 
-base_model.trainable = True
-
-for layer in base_model.layers[:-80]:
+# Freeze base layers
+for layer in base_model.layers:
     layer.trainable = False
 
+x = base_model.output
+x = GlobalAveragePooling2D()(x)
+x = Dense(128, activation='relu')(x)
+x = Dropout(0.5)(x)
+outputs = Dense(NUM_CLASSES, activation='softmax')(x)
 
-inputs = layers.Input(shape=(224,224,3))
-x = normalization(inputs)
-x = data_augmentation(x)
+model = Model(inputs=base_model.input, outputs=outputs)
 
-x = base_model(x, training=False)
-x = layers.GlobalAveragePooling2D()(x)
-x = layers.Dense(128, activation='relu')(x)
-x = layers.Dropout(0.4)(x)
+# ==============================
+# COMPILE MODEL
+# ==============================
 
-if num_classes == 2:
-    outputs = layers.Dense(1, activation='sigmoid')(x)
-    loss_fn = 'binary_crossentropy'
-else:
-    outputs = layers.Dense(num_classes, activation='softmax')(x)
-    loss_fn = 'sparse_categorical_crossentropy'
-    
-# Print AFTER assignment
-print("Loss:", loss_fn)   # <-- Step 4: Verify loss function    
-
-model = models.Model(inputs, outputs)
-model.summary()
-
-# =====================================================
-# COMPILE INITIAL MODEL
-# =====================================================
 model.compile(
-    optimizer=tf.keras.optimizers.Adam(learning_rate=5e-5),
-    loss=loss_fn,
+    optimizer=tf.keras.optimizers.Adam(learning_rate=0.0001),
+    loss='categorical_crossentropy',
     metrics=['accuracy']
 )
 
-# =====================================================
+model.summary()
+
+# ==============================
 # CALLBACKS
-# =====================================================
-checkpoint_path = r"C:/Users/Lenovo/OneDrive/Desktop/AI-Anemia-Detection/src/models/anemia_best.keras"
-os.makedirs(os.path.dirname(checkpoint_path), exist_ok=True)
+# ==============================
 
-checkpoint_cb = tf.keras.callbacks.ModelCheckpoint(
-    checkpoint_path,
-    save_best_only=True,
+early_stop = EarlyStopping(
     monitor='val_loss',
-    verbose=1
-)
-
-early_stop_cb = tf.keras.callbacks.EarlyStopping(
-    patience=6,
+    patience=5,
     restore_best_weights=True
 )
 
-# =====================================================
-# OPTIONAL CLASS WEIGHTS (EDIT IF IMBALANCED)
-# =====================================================
-class_weight = None
-
-
-# =====================================================
-# TRAIN STAGE 1 (FEATURE EXTRACTION)
-# =====================================================
-print("\n🚀 Starting Initial Training...")
-model.fit(
-    train_ds,
-    validation_data=val_ds,
-    epochs=EPOCHS_INITIAL,
-    callbacks=[checkpoint_cb, early_stop_cb],
-    class_weight=class_weight
+reduce_lr = ReduceLROnPlateau(
+    monitor='val_loss',
+    factor=0.3,
+    patience=3,
+    min_lr=1e-6
 )
 
-# =====================================================
-# FINE-TUNING
-# =====================================================
-print("\n🔧 Starting Fine-Tuning...")
+# ==============================
+# TRAIN MODEL
+# ==============================
 
-base_model.trainable = True
+history = model.fit(
+    train_generator,
+    validation_data=val_generator,
+    epochs=EPOCHS,
+    class_weight=class_weights,
+    callbacks=[early_stop, reduce_lr]
+)
 
-for layer in base_model.layers[:-30]:
-    layer.trainable = False
+# ==============================
+# FINE TUNING
+# ==============================
+
+print("\nStarting Fine-Tuning...")
+
+for layer in base_model.layers[-30:]:
+    layer.trainable = True
 
 model.compile(
-    optimizer=tf.keras.optimizers.Adam(learning_rate=1e-5),
-    loss=loss_fn,
+    optimizer=tf.keras.optimizers.Adam(1e-5),
+    loss='categorical_crossentropy',
     metrics=['accuracy']
 )
 
-model.fit(
-    train_ds,
-    validation_data=val_ds,
-    epochs=EPOCHS_FINE,
-    callbacks=[checkpoint_cb, early_stop_cb],
-    class_weight=class_weight
+history_fine = model.fit(
+    train_generator,
+    validation_data=val_generator,
+    epochs=10
 )
 
-# =====================================================
-# SAVE FINAL MODEL
-# =====================================================
-final_model_path = r"C:/Users/Lenovo/OneDrive/Desktop/AI-Anemia-Detection/src/models/anemia_final.keras"
-model.save(final_model_path)
-print(f"✅ Final model saved at: {final_model_path}")
+# ==============================
+# SAVE MODEL
+# ==============================
 
-# =====================================================
-# TEST EVALUATION
-# =====================================================
-test_loss, test_acc = model.evaluate(test_ds)
-print(f"\n🎯 Test Accuracy: {test_acc * 100:.2f}%")
+os.makedirs(os.path.dirname(MODEL_SAVE_PATH), exist_ok=True)
 
-print("\n✅ Training Complete!")
+model.save(MODEL_SAVE_PATH)
+
+print("Model saved at:", MODEL_SAVE_PATH)
+
+# ==============================
+# PLOT ACCURACY GRAPH
+# ==============================
+
+plt.figure()
+plt.plot(history.history['accuracy'], label="Train Accuracy")
+plt.plot(history.history['val_accuracy'], label="Validation Accuracy")
+plt.legend()
+plt.title("Accuracy Graph")
+plt.xlabel("Epoch")
+plt.ylabel("Accuracy")
+plt.savefig("accuracy_graph.png")
+plt.show()
+
+# ==============================
+# PLOT LOSS GRAPH
+# ==============================
+
+plt.figure()
+plt.plot(history.history['loss'], label="Train Loss")
+plt.plot(history.history['val_loss'], label="Validation Loss")
+plt.legend()
+plt.title("Loss Graph")
+plt.xlabel("Epoch")
+plt.ylabel("Loss")
+plt.savefig("loss_graph.png")
+plt.show()
+
+# ==============================
+# CONFUSION MATRIX
+# ==============================
+
+val_generator.reset()
+
+pred = model.predict(val_generator)
+
+pred_classes = np.argmax(pred, axis=1)
+true_classes = val_generator.classes
+
+cm = confusion_matrix(true_classes, pred_classes)
+
+plt.figure(figsize=(6,5))
+sns.heatmap(cm, annot=True,
+            xticklabels=CLASS_NAMES,
+            yticklabels=CLASS_NAMES,
+            fmt="d")
+
+plt.title("Confusion Matrix")
+plt.ylabel("Actual")
+plt.xlabel("Predicted")
+plt.savefig("confusion_matrix.png")
+plt.show()
+
+# ==============================
+# CLASSIFICATION REPORT
+# ==============================
+
+print("\nClassification Report\n")
+
+print(classification_report(
+    true_classes,
+    pred_classes,
+    target_names=CLASS_NAMES
+))
